@@ -1,0 +1,4 @@
+services:
+  owetogether:
+    build: .
+    image: owetogether:local

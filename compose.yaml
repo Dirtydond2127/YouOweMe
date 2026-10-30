@@ -1,0 +1,24 @@
+services:
+  owetogether:
+    image: ${APP_IMAGE:?Set APP_IMAGE to your published GHCR image}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8095}:8000"
+    environment:
+      APP_URL: ${APP_URL:?Set your public HTTPS origin}
+      SECRET_KEY: ${SECRET_KEY:?Set a long random secret}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set Google client ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?Set Google client secret}
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+      DATABASE_PATH: /data/owe.sqlite3
+    volumes:
+      - owe_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  owe_data:
