@@ -1,4 +1,18 @@
 # OweTogether
+## Deploy this repository
+
+The image is `ghcr.io/dirtydond2127/youoweme:latest`. GitHub Actions builds it on every push to `main` for AMD64 and ARM64.
+
+In Portainer, choose **Stacks > Add stack > Repository**, name the stack `youoweme`, and use:
+
+- Repository URL: `https://github.com/Dirtydond2127/YouOweMe`
+- Reference: `refs/heads/main`
+- Compose path: `compose.yaml`
+
+Set `APP_URL`, `SECRET_KEY`, `GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET` before deployment. `APP_IMAGE` defaults to this repository's image. The default host port is `8095`, bound to loopback for a host-based reverse proxy. For a proxy on your LAN or in Docker, choose a reachable private `BIND_ADDRESS` or attach a shared Docker network as described below. Use an HTTPS origin for Google login and secure sessions.
+
+Wait for the container workflow to succeed before deploying. If GHCR denies the pull, configure read access to the package in Portainer or make the package public in GitHub. Keep secrets in Portainer; never put them in Git.
+
 
 A self-hosted, mobile-friendly progressive web app for recording money owed between people. GBP only in this version. No payments are processed.
 

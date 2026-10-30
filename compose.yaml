@@ -1,6 +1,6 @@
 services:
   owetogether:
-    image: ${APP_IMAGE:?Set APP_IMAGE to your published GHCR image}
+    image: ${APP_IMAGE:-ghcr.io/dirtydond2127/youoweme:latest}
     restart: unless-stopped
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8095}:8000"
