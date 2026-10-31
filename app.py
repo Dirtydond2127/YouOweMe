@@ -1,4 +1,5 @@
 import os, sqlite3, secrets, hmac, json
+import random
 from datetime import date, timedelta
 from pathlib import Path
 from functools import wraps
@@ -36,6 +37,19 @@ def close_db(error):
     if connection: connection.close()
 
 with app.app_context():
+    db_file=Path(DB)
+    if db_file.exists() and db_file.stat().st_size:
+        existing=sqlite3.connect(DB,timeout=20)
+        try:
+            tables={r[0] for r in existing.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            cols={r[1] for r in existing.execute('PRAGMA table_info(entries)')} if 'entries' in tables else set()
+            if 'entries' in tables and 'group_id' not in cols:
+                backup_path=f"{DB}.pre-groups-{__import__('datetime').datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
+                target=sqlite3.connect(backup_path)
+                try: existing.backup(target)
+                finally: target.close()
+                app.logger.info('Created pre-migration database backup at %s',backup_path)
+        finally: existing.close()
     db().executescript("""
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS users (
@@ -44,9 +58,16 @@ with app.app_context():
     CREATE TABLE IF NOT EXISTS contacts (
         a INTEGER REFERENCES users(id), b INTEGER REFERENCES users(id),
         PRIMARY KEY(a,b), CHECK(a<b));
+    CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL, creator INTEGER NOT NULL REFERENCES users(id),
+        code TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS group_members (
+        group_id INTEGER NOT NULL REFERENCES groups(id), user_id INTEGER NOT NULL REFERENCES users(id),
+        joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(group_id,user_id));
     CREATE TABLE IF NOT EXISTS entries (
         id INTEGER PRIMARY KEY, creator INTEGER NOT NULL REFERENCES users(id),
         creditor INTEGER NOT NULL REFERENCES users(id), debtor INTEGER NOT NULL REFERENCES users(id),
+        group_id INTEGER REFERENCES groups(id), deleted_at TEXT, deleted_by INTEGER REFERENCES users(id),
         amount INTEGER NOT NULL CHECK(amount>0), description TEXT NOT NULL, date TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected','settled')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, settled_at TEXT,
@@ -58,6 +79,25 @@ with app.app_context():
     CREATE INDEX IF NOT EXISTS entry_creditor ON entries(creditor);
     CREATE INDEX IF NOT EXISTS entry_debtor ON entries(debtor);
     """)
+    connection=db()
+    connection.execute('BEGIN IMMEDIATE')
+    columns={row['name'] for row in connection.execute('PRAGMA table_info(entries)')}
+    if 'group_id' not in columns: db().execute('ALTER TABLE entries ADD COLUMN group_id INTEGER REFERENCES groups(id)')
+    if 'deleted_at' not in columns: db().execute('ALTER TABLE entries ADD COLUMN deleted_at TEXT')
+    if 'deleted_by' not in columns: db().execute('ALTER TABLE entries ADD COLUMN deleted_by INTEGER REFERENCES users(id)')
+    connection.execute('CREATE INDEX IF NOT EXISTS entry_group ON entries(group_id)')
+    # Preserve old pairwise access: each existing connection becomes its own private group.
+    for contact in db().execute('SELECT a,b FROM contacts').fetchall():
+        pair=tuple(sorted((contact['a'],contact['b'])))
+        group=db().execute('SELECT id FROM groups WHERE id IN (SELECT group_id FROM group_members WHERE user_id=?) GROUP BY id HAVING COUNT(*)=2 AND SUM(CASE WHEN user_id IN (?,?) THEN 1 ELSE 0 END)=2 LIMIT 1',(pair[0],*pair)).fetchone()
+        if not group:
+            names=db().execute('SELECT name FROM users WHERE id IN (?,?) ORDER BY id',(pair[0],pair[1])).fetchall()
+            label=' & '.join(row['name'] for row in names)[:100]
+            gid=db().execute('INSERT INTO groups(name,creator,code) VALUES(?,?,?)',(label,pair[0],secrets.token_urlsafe(18))).lastrowid
+            db().executemany('INSERT INTO group_members(group_id,user_id) VALUES(?,?)',[(gid,pair[0]),(gid,pair[1])])
+            group={'id':gid}
+        db().execute('UPDATE entries SET group_id=? WHERE group_id IS NULL AND ((creditor=? AND debtor=?) OR (creditor=? AND debtor=?))',(group['id'],*pair,*pair))
+    db().commit()
     db().commit()
 
 def auth(fn):
@@ -123,6 +163,10 @@ def callback():
             (user['sub'],user.get('name','Member')[:100],user['email'],secrets.token_urlsafe(18)))
         connection.commit()
         uid=connection.execute('SELECT id FROM users WHERE sub=?',(user['sub'],)).fetchone()['id']
+        if not connection.execute('SELECT 1 FROM group_members WHERE user_id=?',(uid,)).fetchone():
+            gid=connection.execute('INSERT INTO groups(name,creator,code) VALUES(?,?,?)',(user.get('name','My group')[:80],uid,secrets.token_urlsafe(18))).lastrowid
+            connection.execute('INSERT INTO group_members(group_id,user_id) VALUES(?,?)',(gid,uid))
+            session['group_id']=gid
         session.clear(); session.permanent=True
         session['uid']=uid; session['csrf']=secrets.token_urlsafe(32)
         return redirect('/')
@@ -140,13 +184,55 @@ def logout():
 @auth
 def me():
     user=dict(db().execute('SELECT id,name,email,code FROM users WHERE id=?',(session['uid'],)).fetchone())
+    admin_email=os.environ.get('ADMIN_EMAIL','').strip().lower()
+    user['is_admin']=bool(admin_email and user['email'].lower()==admin_email)
     return {'user':user,'csrf':session['csrf']}
+
+def active_group(uid):
+    gid=session.get('group_id')
+    if gid and db().execute('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?',(gid,uid)).fetchone(): return gid
+    row=db().execute('SELECT group_id FROM group_members WHERE user_id=? ORDER BY joined_at,group_id LIMIT 1',(uid,)).fetchone()
+    session['group_id']=row['group_id'] if row else None
+    return session['group_id']
+
+@app.get('/api/groups')
+@auth
+def groups():
+    uid=session['uid']; current=active_group(uid)
+    rows=db().execute('SELECT g.id,g.name,g.code,COUNT(gm2.user_id) members FROM groups g JOIN group_members gm ON gm.group_id=g.id LEFT JOIN group_members gm2 ON gm2.group_id=g.id WHERE gm.user_id=? GROUP BY g.id ORDER BY g.created_at,g.id',(uid,)).fetchall()
+    return jsonify(current=current,groups=[dict(r) for r in rows])
+
+@app.post('/api/groups')
+@auth
+def create_group():
+    data=request.get_json(silent=True) or {}; name=data.get('name','')
+    if not isinstance(name,str) or not 1<=len(name.strip())<=80: return {'error':'Enter a group name up to 80 characters.'},400
+    conn=db(); gid=conn.execute('INSERT INTO groups(name,creator,code) VALUES(?,?,?)',(name.strip(),session['uid'],secrets.token_urlsafe(18))).lastrowid
+    conn.execute('INSERT INTO group_members(group_id,user_id) VALUES(?,?)',(gid,session['uid']));conn.commit();session['group_id']=gid
+    return {'ok':True},201
+
+@app.post('/api/groups/join')
+@auth
+def join_group():
+    data=request.get_json(silent=True) or {}; code=data.get('code','')
+    if not isinstance(code,str) or len(code)>100:return {'error':'Invalid invitation code.'},400
+    group=db().execute('SELECT id FROM groups WHERE code=?',(code.strip(),)).fetchone()
+    if not group:return {'error':'Group invitation not found.'},404
+    db().execute('INSERT OR IGNORE INTO group_members(group_id,user_id) VALUES(?,?)',(group['id'],session['uid']));db().commit();session['group_id']=group['id']
+    return {'ok':True}
+
+@app.post('/api/groups/select')
+@auth
+def select_group():
+    gid=(request.get_json(silent=True) or {}).get('group_id')
+    if type(gid) is not int or not db().execute('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?',(gid,session['uid'])).fetchone():return {'error':'Group not found.'},404
+    session['group_id']=gid;return {'ok':True}
 
 @app.get('/api/people')
 @auth
 def people():
-    uid=session['uid']
-    rows=db().execute('SELECT id,name FROM users WHERE id IN (SELECT CASE WHEN a=? THEN b ELSE a END FROM contacts WHERE a=? OR b=?) ORDER BY name',(uid,uid,uid)).fetchall()
+    uid=session['uid']; gid=active_group(uid)
+    rows=db().execute('SELECT u.id,u.name FROM users u JOIN group_members gm ON gm.user_id=u.id WHERE gm.group_id=? AND u.id<>? ORDER BY u.name',(gid,uid)).fetchall() if gid else []
     return jsonify([dict(r) for r in rows])
 
 @app.post('/api/people')
@@ -155,23 +241,24 @@ def add_person():
     data=request.get_json(silent=True) or {}
     code=data.get('code','')
     if not isinstance(code,str) or len(code)>100: return {'error':'Invalid connection code.'},400
-    person=db().execute('SELECT id FROM users WHERE code=?',(code.strip(),)).fetchone()
-    if not person or person['id']==session['uid']: return {'error':'Connection code not found.'},400
-    a,b=sorted([session['uid'],person['id']])
-    db().execute('INSERT OR IGNORE INTO contacts(a,b) VALUES(?,?)',(a,b));db().commit()
+    group=db().execute('SELECT id FROM groups WHERE code=?',(code.strip(),)).fetchone()
+    if not group:return {'error':'Group invitation not found.'},404
+    db().execute('INSERT OR IGNORE INTO group_members(group_id,user_id) VALUES(?,?)',(group['id'],session['uid']));db().commit();session['group_id']=group['id']
     return {'ok':True}
 
 @app.post('/api/code/rotate')
 @auth
 def rotate_code():
-    db().execute('UPDATE users SET code=? WHERE id=?',(secrets.token_urlsafe(18),session['uid']));db().commit()
+    gid=active_group(session['uid'])
+    if not gid:return {'error':'Create a group first.'},400
+    db().execute('UPDATE groups SET code=? WHERE id=?',(secrets.token_urlsafe(18),gid));db().commit()
     return {'ok':True}
 
 @app.get('/api/entries')
 @auth
 def entries():
-    uid=session['uid']
-    rows=db().execute('SELECT e.*,c.name creditor_name,d.name debtor_name FROM entries e JOIN users c ON c.id=e.creditor JOIN users d ON d.id=e.debtor WHERE e.creditor=? OR e.debtor=? ORDER BY e.date DESC,e.id DESC',(uid,uid)).fetchall()
+    uid=session['uid'];gid=active_group(uid)
+    rows=db().execute('SELECT e.*,c.name creditor_name,d.name debtor_name FROM entries e JOIN users c ON c.id=e.creditor JOIN users d ON d.id=e.debtor WHERE e.group_id=? AND e.deleted_at IS NULL ORDER BY e.date DESC,e.id DESC',(gid,)).fetchall() if gid else []
     return jsonify([dict(r) for r in rows])
 
 @app.post('/api/entries')
@@ -186,11 +273,11 @@ def add_entry():
     try:
         entry_date=date.fromisoformat(data.get('date','')).isoformat()
     except (ValueError,TypeError): return {'error':'Choose a valid date.'},400
-    a,b=sorted([uid,person])
-    if not db().execute('SELECT 1 FROM contacts WHERE a=? AND b=?',(a,b)).fetchone():
+    gid=active_group(uid)
+    if not gid or not db().execute('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?',(gid,person)).fetchone():
         return {'error':'Choose one of your connected people.'},403
     creditor,debtor=(uid,person) if direction=='owed' else (person,uid)
-    cursor=db().execute('INSERT INTO entries(creator,creditor,debtor,amount,description,date) VALUES(?,?,?,?,?,?)',(uid,creditor,debtor,amount,description.strip(),entry_date))
+    cursor=db().execute('INSERT INTO entries(creator,creditor,debtor,group_id,amount,description,date) VALUES(?,?,?,?,?,?,?)',(uid,creditor,debtor,gid,amount,description.strip(),entry_date))
     db().execute('INSERT INTO audit(entry_id,actor,action) VALUES(?,?,?)',(cursor.lastrowid,uid,'created'))
     db().commit();return {'ok':True},201
 
@@ -200,7 +287,8 @@ def action_entry(eid,action):
     uid=session['uid'];connection=db()
     # Serialise read/check/write to prevent competing state changes.
     connection.execute('BEGIN IMMEDIATE')
-    entry=connection.execute('SELECT * FROM entries WHERE id=? AND (creditor=? OR debtor=?)',(eid,uid,uid)).fetchone()
+    gid=active_group(uid)
+    entry=connection.execute('SELECT * FROM entries WHERE id=? AND group_id=? AND deleted_at IS NULL AND (creditor=? OR debtor=?)',(eid,gid,uid,uid)).fetchone()
     if not entry: return {'error':'Entry not found.'},404
     status=None
     if action in ('accept','reject') and entry['status']=='pending' and entry['creator']!=uid:
@@ -215,9 +303,30 @@ def action_entry(eid,action):
 @app.get('/api/export')
 @auth
 def export():
-    uid=session['uid']
-    rows=db().execute('SELECT e.*,c.name creditor_name,d.name debtor_name FROM entries e JOIN users c ON c.id=e.creditor JOIN users d ON d.id=e.debtor WHERE creditor=? OR debtor=? ORDER BY e.id',(uid,uid)).fetchall()
-    audit=db().execute('SELECT a.* FROM audit a JOIN entries e ON a.entry_id=e.id WHERE e.creditor=? OR e.debtor=? ORDER BY a.id',(uid,uid)).fetchall()
+    uid=session['uid'];gid=active_group(uid)
+    rows=db().execute('SELECT e.*,c.name creditor_name,d.name debtor_name FROM entries e JOIN users c ON c.id=e.creditor JOIN users d ON d.id=e.debtor WHERE e.group_id=? AND e.deleted_at IS NULL ORDER BY e.id',(gid,)).fetchall() if gid else []
+    audit=db().execute('SELECT a.* FROM audit a JOIN entries e ON a.entry_id=e.id WHERE e.group_id=? AND e.deleted_at IS NULL ORDER BY a.id',(gid,)).fetchall() if gid else []
     response=jsonify(entries=[dict(r) for r in rows],audit=[dict(r) for r in audit],currency='GBP')
     response.headers['Content-Disposition']='attachment; filename=owetogether-export.json'
     return response
+
+@app.get('/api/admin/entries')
+@auth
+def admin_entries():
+    email=os.environ.get('ADMIN_EMAIL','').strip().lower()
+    current=db().execute('SELECT email FROM users WHERE id=?',(session['uid'],)).fetchone()
+    if not email or not current or current['email'].lower()!=email:return {'error':'Administrator access required.'},403
+    rows=db().execute('SELECT e.*,c.name creditor_name,d.name debtor_name,g.name group_name FROM entries e JOIN users c ON c.id=e.creditor JOIN users d ON d.id=e.debtor JOIN groups g ON g.id=e.group_id ORDER BY e.id DESC').fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.post('/api/admin/entries/<int:eid>/delete')
+@auth
+def admin_delete_entry(eid):
+    email=os.environ.get('ADMIN_EMAIL','').strip().lower()
+    current=db().execute('SELECT email FROM users WHERE id=?',(session['uid'],)).fetchone()
+    if not email or not current or current['email'].lower()!=email:return {'error':'Administrator access required.'},403
+    conn=db();entry=conn.execute('SELECT id FROM entries WHERE id=? AND deleted_at IS NULL',(eid,)).fetchone()
+    if not entry:return {'error':'Entry not found.'},404
+    conn.execute('UPDATE entries SET deleted_at=CURRENT_TIMESTAMP,deleted_by=? WHERE id=?',(session['uid'],eid))
+    conn.execute('INSERT INTO audit(entry_id,actor,action) VALUES(?,?,?)',(eid,session['uid'],'admin_soft_delete'));conn.commit()
+    return {'ok':True}

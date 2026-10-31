@@ -10,13 +10,17 @@ class AccessTests(unittest.TestCase):
         app.config['TESTING']=True
         self.client=app.test_client()
         with app.app_context():
-            db().executescript('DELETE FROM audit;DELETE FROM entries;DELETE FROM contacts;DELETE FROM users;')
+            db().executescript('DELETE FROM audit;DELETE FROM entries;DELETE FROM group_members;DELETE FROM groups;DELETE FROM contacts;DELETE FROM users;')
             for i in range(1,4):
                 db().execute('INSERT INTO users(id,sub,name,email,code) VALUES(?,?,?,?,?)',(i,str(i),'User '+str(i),str(i)+'@example.com','code'+str(i)))
-            db().execute('INSERT INTO contacts(a,b) VALUES(1,2)');db().commit()
+            db().execute('INSERT INTO contacts(a,b) VALUES(1,2)')
+            gid=db().execute("INSERT INTO groups(name,creator,code) VALUES('Pair',1,'groupcode')").lastrowid
+            db().executemany('INSERT INTO group_members(group_id,user_id) VALUES(?,?)',[(gid,1),(gid,2)]);db().commit()
     def user(self,uid):
         with self.client.session_transaction(base_url='https://owe.example.com') as s:
-            s['uid']=uid;s['csrf']='test-csrf'
+            with app.app_context():
+                group_id=db().execute('SELECT id FROM groups WHERE code=?',('groupcode',)).fetchone()['id']
+            s['uid']=uid;s['csrf']='test-csrf';s['group_id']=group_id
     def get(self,path):return self.client.get(path,base_url='https://owe.example.com')
     def post(self,path,data=None,csrf=True):
         return self.client.post(path,json=data,base_url='https://owe.example.com',headers={'Origin':'https://owe.example.com',**({'X-CSRF-Token':'test-csrf'} if csrf else {})})
@@ -52,8 +56,8 @@ class AccessTests(unittest.TestCase):
     def test_contacts_private(self):
         self.user(1);self.assertEqual([p['id'] for p in self.get('/api/people').json],[2])
     def test_connect_by_code(self):
-        self.user(3);self.assertEqual(self.post('/api/people',{'code':'code1'}).status_code,200)
-        self.assertEqual([p['id'] for p in self.get('/api/people').json],[1])
+        self.user(3);self.assertEqual(self.post('/api/people',{'code':'groupcode'}).status_code,200)
+        self.assertEqual([p['id'] for p in self.get('/api/people').json],[1,2])
     def test_no_api_caching(self):
         self.user(1);self.assertEqual(self.get('/api/me').headers['Cache-Control'],'no-store')
 

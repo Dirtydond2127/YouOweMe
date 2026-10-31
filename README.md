@@ -1,4 +1,4 @@
-# OweTogether
+# OweYeah
 ## Deploy this repository
 
 The image is `ghcr.io/dirtydond2127/youoweme:latest`. GitHub Actions builds it on every push to `main` for AMD64 and ARM64.
@@ -28,6 +28,12 @@ A self-hosted, mobile-friendly progressive web app for recording money owed betw
 - Persistent SQLite storage in a Docker named volume.
 - Installable PWA with manifest, PNG icons, service worker, and offline notice. Financial data is NOT cached offline; creating or viewing entries requires a connection.
 - Dockerfile, Portainer Compose stack, GitHub Actions container build, and access-control tests.
+
+## Groups and admin access
+
+Each existing connected pair is migrated into a private group containing those same two people. Existing entry IDs, amounts and statuses are retained, and the migration is repeat-safe. New users start with a private group. Create additional groups from the sidebar and share each group's invitation code privately. Members can access entries only in groups they joined.
+
+Set `ADMIN_EMAIL` in Portainer to the exact email of the verified Google account that should manage entries. This account can review entries across groups and soft-delete entries; removed entries remain stored with the deletion actor and audit event. Admin access is denied when the setting is blank or does not match. The app creates a one-time database backup in its persistent volume before applying the group migration.
 
 The interactive Canvas preview is a separate browser-only demonstration. This repository is the actual server application. The deployed app starts empty, without demo users or debts.
 

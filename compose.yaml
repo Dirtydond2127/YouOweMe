@@ -10,6 +10,7 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set Google client ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?Set Google client secret}
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       DATABASE_PATH: /data/owe.sqlite3
     volumes:
       - owe_data:/data

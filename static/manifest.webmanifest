@@ -1,12 +1,12 @@
 {
   "id": "/",
-  "name": "OweTogether",
-  "short_name": "OweTogether",
+  "name": "OweYeah",
+  "short_name": "OweYeah",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#f7f8fc",
-  "theme_color": "#4f46e5",
+  "theme_color": "#0f766e",
   "icons": [
     {
       "src": "/static/icon-192.png",
