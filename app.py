@@ -89,7 +89,7 @@ with app.app_context():
     # Preserve old pairwise access: each existing connection becomes its own private group.
     for contact in db().execute('SELECT a,b FROM contacts').fetchall():
         pair=tuple(sorted((contact['a'],contact['b'])))
-        group=db().execute('SELECT id FROM groups WHERE id IN (SELECT group_id FROM group_members WHERE user_id=?) GROUP BY id HAVING COUNT(*)=2 AND SUM(CASE WHEN user_id IN (?,?) THEN 1 ELSE 0 END)=2 LIMIT 1',(pair[0],*pair)).fetchone()
+        group=db().execute('SELECT g.id FROM groups g JOIN group_members gm ON gm.group_id=g.id WHERE g.id IN (SELECT group_id FROM group_members WHERE user_id=?) GROUP BY g.id HAVING COUNT(*)=2 AND SUM(CASE WHEN gm.user_id IN (?,?) THEN 1 ELSE 0 END)=2 LIMIT 1',(pair[0],*pair)).fetchone()
         if not group:
             names=db().execute('SELECT name FROM users WHERE id IN (?,?) ORDER BY id',(pair[0],pair[1])).fetchall()
             label=' & '.join(row['name'] for row in names)[:100]
